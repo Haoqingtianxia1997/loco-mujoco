@@ -681,6 +681,9 @@ class IPPOJax(JaxRLAlgorithmBase):
             env = cls._wrap_env(env, config, world_conf=world_conf)
 
         agent_names = tuple(agent_conf.networks.keys())
+        terminal_value_bootstrap_enabled = bool(
+            getattr(env, "terminal_value_bootstrap_enabled", False)
+        )
         juggle_reward_terms = tuple(dict.fromkeys(
             str(term)
             for name in agent_names
@@ -761,7 +764,20 @@ class IPPOJax(JaxRLAlgorithmBase):
             phase_loss_coef = 0.0
             phase_rate_loss_coef = 0.0
 
-        def _inject_phase_history(obs, phase_history, phase_history_valid):
+        phase_feedback_enabled = bool(
+            agent_conf.config.env.get("three_ball_catch_juggle", {}).get(
+                "deployment_curriculum", {}
+            ).get("enabled", False)
+        )
+        if phase_feedback_enabled and phase_agent_name is None:
+            raise ValueError("Deployment curriculum requires a phase prediction head")
+        phase_start_after_observation = (
+            agent_conf.config.env.get("three_ball_catch_juggle", {}).get(
+                "startup_phase_mode", "catch_throw_boundary"
+            ) == "right_dwell_bottom"
+        )
+
+        def _inject_phase_history(obs, phase_history, phase_history_valid, deployment_episode=None):
             if phase_agent_name is None:
                 return obs
             obs_frames = obs.reshape(obs.shape[:-1] + (phase_history_len, phase_frame_dim))
@@ -778,6 +794,16 @@ class IPPOJax(JaxRLAlgorithmBase):
                 )
                 phase_obs = jnp.where(
                     phase_history_valid[..., None], phase_obs, 0.0
+                )
+            if phase_feedback_enabled:
+                predicted_obs = encode_supercycle_phase(
+                    phase_history, phase_num_hands, phase_num_balls
+                )
+                predicted_obs = jnp.where(
+                    phase_history_valid[..., None], predicted_obs, 0.0
+                )
+                phase_obs = jnp.where(
+                    deployment_episode[..., None, None], predicted_obs, phase_obs
                 )
             obs_frames = obs_frames.at[..., phase_obs_ind].set(phase_obs.astype(obs.dtype))
             return obs_frames.reshape(obs.shape)
@@ -1081,8 +1107,34 @@ class IPPOJax(JaxRLAlgorithmBase):
 
                 # SELECT ACTION
                 phase_input_visible = _current_ball_position_visible(last_obs)
+                deployment_episode = None
+                if phase_feedback_enabled:
+                    deployment_episode = env_state.additional_carry.deployment_episode
+                    frames = last_obs.reshape(last_obs.shape[:-1] + (phase_history_len, phase_frame_dim))
+                    history_visible = ball_position_visible(
+                        frames, phase_visibility_obs_ind, "any_history"
+                    )
+                    latest_visible = ball_position_visible(
+                        frames, phase_visibility_obs_ind, "latest"
+                    )
+                    arms_active = env_state.additional_carry.upper_policy_active
+                    # Waiting observations train the predictor independently of
+                    # the arm PPO mask. Empty waiting histories are not labels.
+                    if phase_start_after_observation:
+                        # Incoming phase begins at first visibility; normal
+                        # juggling begins with its pattern. Once started, keep
+                        # predicting and training through masked observations.
+                        phase_input_visible = env_state.additional_carry.phase_observing
+                        phase_control_valid = phase_input_visible
+                    else:
+                        phase_input_visible = jnp.where(
+                            arms_active, phase_input_visible, history_visible
+                        )
+                        phase_control_valid = jnp.where(
+                            arms_active, phase_input_visible, latest_visible
+                        )
                 policy_obs = _inject_phase_history(
-                    last_obs, phase_history, phase_history_valid
+                    last_obs, phase_history, phase_history_valid, deployment_episode
                 )
                 rng, _rng = jax.random.split(rng)
                 agent_actions = {}
@@ -1226,6 +1278,12 @@ class IPPOJax(JaxRLAlgorithmBase):
                     new_train_states[name] = ts
 
                 action = _scatter_actions(num_envs, full_action_dim, agent_actions, agent_action_idx)
+                if phase_feedback_enabled:
+                    # Feedback is a control signal, not a policy action: it is
+                    # excluded from distributions, log probabilities and PPO.
+                    action = env.pack_phase_control(
+                        action, agent_phase_preds[phase_agent_name], phase_control_valid
+                    )
 
                 # Label the transition with its source stage, before env.step
                 # can promote the curriculum or reset the episode.
@@ -1235,6 +1293,37 @@ class IPPOJax(JaxRLAlgorithmBase):
                     )
                 # STEP ENV
                 obsv, reward, absorbing, done, info, env_state = env.step(env_state, action)
+                if terminal_value_bootstrap_enabled:
+                    # Keep only scalar values in the rollout, not another full
+                    # observation history for every transition. Critic inputs
+                    # contain the final GT phase, independent of actor feedback.
+                    info = dict(info)
+                    terminal_obs = info.pop("terminal_observation")
+                    terminal_flags = env_state.additional_carry.terminal_state_handler_state.is_absorbing_dict
+                    needs_bootstrap = jnp.any(jnp.stack([
+                        done & ~terminal_flags[agent_conf.config.env.agent[name].absorbing_key]
+                        for name in agent_names
+                    ]))
+
+                    def terminal_values(_):
+                        values = {}
+                        for name in agent_names:
+                            ts = new_train_states[name]
+                            kwargs = {}
+                            if agent_is_trxl[name]:
+                                kwargs = dict(mems=new_agent_mems[name], attn_mask=None, train=False)
+                            prediction = agent_conf.networks[name].apply(
+                                {"params": ts.params, "run_stats": ts.run_stats},
+                                terminal_obs, **kwargs,
+                            )
+                            values[name] = prediction[1]
+                        return values
+
+                    info["terminal_values"] = jax.lax.cond(
+                        needs_bootstrap, terminal_values,
+                        lambda _: {name: jnp.zeros_like(agent_values[name]) for name in agent_names},
+                        operand=None,
+                    )
                 if phase_agent_name is not None and phase_train_from_stage > 0:
                     info = {**info, "phase_training_enabled": jnp.broadcast_to(
                         rollout_phase_training_enabled, done.shape
@@ -1600,7 +1689,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                 # CALCULATE ADVANTAGE
                 # bootstrap values per agent
                 bootstrap_obs = _inject_phase_history(
-                    last_obs, phase_history, phase_history_valid
+                    last_obs, phase_history, phase_history_valid,
+                    env_state.additional_carry.deployment_episode if phase_feedback_enabled else None,
                 )
                 bootstrap_residual_history = dict(
                     residual_base_action_history
@@ -1675,6 +1765,8 @@ class IPPOJax(JaxRLAlgorithmBase):
                             value = transition.value[name]
                             reward = transition.reward[name]
                             nv = next_value[name]
+                            if terminal_value_bootstrap_enabled:
+                                nv = jnp.where(done, transition.info["terminal_values"][name], nv)
                             g = gae[name]
                             absorbing_key = agent_conf.config.env.agent[name].absorbing_key
                             absorbing = transition.absorbing_dict[absorbing_key]

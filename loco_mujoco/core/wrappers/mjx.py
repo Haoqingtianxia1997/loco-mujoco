@@ -432,6 +432,9 @@ class NStepWrapper(BaseWrapper):
             state.observation_buffer, shift=-1, axis=0
         )
         stepped_buffer = stepped_buffer.at[-1].set(next_observation)
+        if getattr(self.env, "terminal_value_bootstrap_enabled", False):
+            # Critic bootstrap needs the final history before actor history resets.
+            info = {**info, "terminal_observation": jnp.reshape(stepped_buffer, (-1,))}
 
         reset_buffer = jnp.zeros_like(stepped_buffer)
         reset_buffer = reset_buffer.at[-1].set(env_state.observation)
